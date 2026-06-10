@@ -1,0 +1,28 @@
+{
+  "name": "workplaner_discordbot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js",
+    "check": "node --check src/bot.js",
+    "test": "echo \"No automated tests configured\" && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheDawnz/workplaner_discordbot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/TheDawnz/workplaner_discordbot/issues"
+  },
+  "homepage": "https://github.com/TheDawnz/workplaner_discordbot#readme",
+  "dependencies": {
+    "discord.js": "^14.26.4",
+    "dotenv": "^16.4.7",
+    "@supabase/supabase-js": "^2.56.0"
+  }
+}
