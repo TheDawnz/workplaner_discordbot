@@ -1,6 +1,7 @@
 require("dotenv").config();
 const {
 	Client,
+	AttachmentBuilder,
 	EmbedBuilder,
 	GatewayIntentBits,
 	PermissionFlagsBits,
@@ -100,11 +101,12 @@ async function initializeDatabase() {
 			status text not null check (status in ('todo', 'progress', 'done')),
 			progress integer not null default 0 check (progress >= 0 and progress <= 100),
 			created_at timestamptz not null default now(),
-			updated_at timestamptz not null default now(),
-			unique(workname, workowner)
+			updated_at timestamptz not null default now()
 		)
 	`);
 
+	await pool.query(`alter table public.${workTable} drop constraint if exists work_items_workname_key`);
+	await pool.query(`create unique index if not exists work_items_workname_owner_idx on public.${workTable} (workname, workowner)`);
 	await pool.query(`create index if not exists work_items_owner_idx on public.${workTable} (workowner)`);
 }
 
@@ -132,6 +134,21 @@ async function findWorkItemsByOwner(workowner) {
 		 where workowner ilike $1
 		 order by created_at desc`,
 		[workowner]
+	);
+
+	return rows.map(toRecord);
+}
+
+async function findWorkItemsByLeader(leadername) {
+	await ensureSupabaseConfigured();
+	const leadernameWithAt = `@${leadername}`;
+	const { rows } = await pool.query(
+		`select id, leadername, workowner, workname, deadline, status, progress, created_at, updated_at
+		 from public.${workTable}
+		 where leadername ilike $1
+		    or leadername ilike $2
+		 order by workowner asc, workname asc`,
+		[leadername, leadernameWithAt]
 	);
 
 	return rows.map(toRecord);
@@ -217,6 +234,31 @@ async function cleanupOldWorkItems() {
 	}
 }
 
+function csvEscape(value) {
+	const text = String(value ?? "");
+	if (/[",\n\r]/.test(text)) {
+		return `"${text.replace(/"/g, '""')}"`;
+	}
+
+	return text;
+}
+
+function buildWorkCsv(items) {
+	const header = ["leadername", "workowner", "workname", "deadline", "status", "progress"];
+	const rows = items.map((item) => [
+		item.leadername,
+		item.workowner,
+		item.workname,
+		item.deadline,
+		item.status,
+		item.progress,
+	]);
+
+	return [header, ...rows]
+		.map((row) => row.map(csvEscape).join(","))
+		.join("\n");
+}
+
 function buildWorkEmbed(item) {
 	return new EmbedBuilder()
 		.setTitle(`Work Progress: ${item.workname}`)
@@ -263,6 +305,15 @@ function buildCommands() {
 							.setMaxValue(100)
 							.setRequired(true)
 					)
+			)
+			.toJSON(),
+		new SlashCommandBuilder()
+			.setName("leader")
+			.setDescription("Leader tools")
+			.addSubcommand((subcommand) =>
+				subcommand
+					.setName("export")
+					.setDescription("Export all work you lead as CSV")
 			)
 			.toJSON(),
 	];
@@ -312,7 +363,7 @@ client.once("clientReady", async () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-	if (!interaction.isChatInputCommand() || interaction.commandName !== "work") {
+	if (!interaction.isChatInputCommand() || (interaction.commandName !== "work" && interaction.commandName !== "leader")) {
 		return;
 	}
 
@@ -431,6 +482,28 @@ client.on("interactionCreate", async (interaction) => {
 			await interaction.reply({
 				content: `Updated "${updatedItem.workname}" to ${updatedItem.progress}% (${updatedItem.status}).`,
 				embeds: [buildWorkEmbed(updatedItem)],
+			});
+			return;
+		}
+
+		if (interaction.commandName === "leader" && interaction.options.getSubcommand() === "export") {
+			const displayName = normalizeText(interaction.member?.displayName);
+			const username = normalizeText(interaction.user.username);
+			const leaderLabel = displayName || username;
+			const items = await findWorkItemsByLeader(displayName || username);
+
+			if (!items.length) {
+				await interaction.reply({ content: `No work items found for leader "${leaderLabel}".`, ephemeral: true });
+				return;
+			}
+
+			const csv = buildWorkCsv(items);
+			const fileName = `${leaderLabel.replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "") || "work_items"}.csv`;
+			const file = new AttachmentBuilder(Buffer.from(csv, "utf8"), { name: fileName });
+
+			await interaction.reply({
+				content: `Exported ${items.length} work item(s) for ${leaderLabel}.`,
+				files: [file],
 			});
 		}
 	} catch (error) {

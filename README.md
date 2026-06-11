@@ -114,6 +114,25 @@ Update the progress of a work item. Status is automatically derived from progres
 
 ---
 
+### `/leader export`
+
+Export all work items you lead as a CSV file.
+
+**Parameters:**
+- None (automatically uses your leader name)
+
+**Usage:**
+```
+/leader export
+```
+
+**Result:**
+- Downloads a `.csv` file with your led work items
+- Rows are sorted by `workowner`, then `workname`
+- Columns: leader name, work owner, work name, deadline, status, progress
+
+---
+
 ## Features
 
 ### Status Management
@@ -125,6 +144,11 @@ Update the progress of a work item. Status is automatically derived from progres
 ### Per-Owner Work Names
 - Different users can have work items with the same name
 - Work names are unique per owner, not globally
+
+### Leader Export
+- Leaders can export every work item they lead as a CSV file
+- Export output is sorted by `workowner`, then `workname`
+- CSV omits internal database fields like `id`, `created_at`, and `updated_at`
 
 ### Automatic Cleanup
 Work items are automatically deleted when:
