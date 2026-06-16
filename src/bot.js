@@ -1,12 +1,18 @@
 require("dotenv").config();
 const {
+	ActionRowBuilder,
+	ButtonBuilder,
+	ButtonStyle,
 	Client,
 	AttachmentBuilder,
 	EmbedBuilder,
 	GatewayIntentBits,
 	PermissionFlagsBits,
 	REST,
+	ModalBuilder,
 	Routes,
+	TextInputBuilder,
+	TextInputStyle,
 	SlashCommandBuilder,
 } = require("discord.js");
 const { Pool } = require("pg");
@@ -17,6 +23,7 @@ const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
 const guildId = process.env.DISCORD_GUILD_ID;
 const databaseUrl = process.env.DATABASE_URL;
+const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
 const pool = databaseUrl
 	? new Pool({
 		connectionString: databaseUrl,
@@ -24,6 +31,11 @@ const pool = databaseUrl
 	})
 	: null;
 const workTable = "work_items";
+const geoGames = new Map();
+const geoGameLifetimeMs = 10 * 60 * 1000;
+const geoMetadataUrl = "https://maps.googleapis.com/maps/api/streetview/metadata";
+const geoImageUrl = "https://maps.googleapis.com/maps/api/streetview";
+const geoGeocodeUrl = "https://maps.googleapis.com/maps/api/geocode/json";
 
 function normalizeText(value) {
 	return String(value || "").trim();
@@ -40,6 +52,325 @@ function readIntegerOption(interaction, name) {
 
 function normalizeKey(value) {
 	return normalizeText(value).toLowerCase();
+}
+
+function randomBetween(min, max) {
+	return Math.random() * (max - min) + min;
+}
+
+function randomGeoId() {
+	return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function formatGeoGuessDistance(distanceKm) {
+	if (distanceKm < 1) {
+		return `${Math.round(distanceKm * 1000)} m`;
+	}
+
+	return `${distanceKm.toFixed(distanceKm < 10 ? 2 : 1)} km`;
+}
+
+function parseCoordinateGuess(value) {
+	const cleaned = normalizeText(value)
+		.replace(/°/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+	const coordinateMatch = cleaned.match(/^(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)$/);
+
+	if (!coordinateMatch) {
+		return null;
+	}
+
+	const latitude = Number(coordinateMatch[1]);
+	const longitude = Number(coordinateMatch[2]);
+
+	if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+		return null;
+	}
+
+	if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+		return null;
+	}
+
+	return { latitude, longitude };
+}
+
+function haversineDistanceKm(startLatitude, startLongitude, endLatitude, endLongitude) {
+	const earthRadiusKm = 6371;
+	const toRadians = (degrees) => (degrees * Math.PI) / 180;
+	const latitudeDelta = toRadians(endLatitude - startLatitude);
+	const longitudeDelta = toRadians(endLongitude - startLongitude);
+	const startLatitudeRadians = toRadians(startLatitude);
+	const endLatitudeRadians = toRadians(endLatitude);
+	const a =
+		Math.sin(latitudeDelta / 2) * Math.sin(latitudeDelta / 2) +
+		Math.cos(startLatitudeRadians) * Math.cos(endLatitudeRadians) * Math.sin(longitudeDelta / 2) * Math.sin(longitudeDelta / 2);
+
+	return 2 * earthRadiusKm * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function buildGeoStreetViewUrl(latitude, longitude, heading) {
+	const params = new URLSearchParams({
+		size: "800x450",
+		location: `${latitude},${longitude}`,
+		fov: "90",
+		heading: String(Math.round(heading)),
+		pitch: "0",
+		key: googleMapsApiKey,
+	});
+
+	return `${geoImageUrl}?${params.toString()}`;
+}
+
+function buildGeoGuessButton(gameId) {
+	return new ActionRowBuilder().addComponents(
+		new ButtonBuilder().setCustomId(`playgeo:guess:${gameId}`).setLabel("Submit Guess").setStyle(ButtonStyle.Primary)
+	);
+}
+
+function buildGeoGuessModal(gameId) {
+	const input = new TextInputBuilder()
+		.setCustomId(`playgeo:guess-input:${gameId}`)
+		.setLabel("Your guess")
+		.setStyle(TextInputStyle.Paragraph)
+		.setRequired(true)
+		.setPlaceholder("Type a place name, address, or coordinates like 51.5, -0.12");
+
+	return new ModalBuilder()
+		.setCustomId(`playgeo:modal:${gameId}`)
+		.setTitle("Submit your guess")
+		.addComponents(new ActionRowBuilder().addComponents(input));
+}
+
+async function fetchJson(url) {
+	const response = await fetch(url);
+
+	if (!response.ok) {
+		throw new Error(`Request failed with status ${response.status}`);
+	}
+
+	return response.json();
+}
+
+async function fetchStreetViewMetadata(latitude, longitude) {
+	const params = new URLSearchParams({
+		location: `${latitude},${longitude}`,
+		key: googleMapsApiKey,
+	});
+
+	return fetchJson(`${geoMetadataUrl}?${params.toString()}`);
+}
+
+async function geocodeGuessToCoordinates(guess) {
+	const directCoordinateGuess = parseCoordinateGuess(guess);
+
+	if (directCoordinateGuess) {
+		return directCoordinateGuess;
+	}
+
+	const params = new URLSearchParams({
+		address: guess,
+		key: googleMapsApiKey,
+	});
+	const result = await fetchJson(`${geoGeocodeUrl}?${params.toString()}`);
+
+	if (result.status !== "OK" || !Array.isArray(result.results) || !result.results.length) {
+		return null;
+	}
+
+	const location = result.results[0]?.geometry?.location;
+
+	if (!location || !Number.isFinite(location.lat) || !Number.isFinite(location.lng)) {
+		return null;
+	}
+
+	return { latitude: location.lat, longitude: location.lng };
+}
+
+async function createGeoGame() {
+	if (!googleMapsApiKey) {
+		throw new Error("Missing GOOGLE_MAPS_API_KEY in the environment.");
+	}
+
+	for (let attempt = 0; attempt < 8; attempt += 1) {
+		const seedLatitude = randomBetween(-60, 75);
+		const seedLongitude = randomBetween(-180, 180);
+		const metadata = await fetchStreetViewMetadata(seedLatitude, seedLongitude);
+		console.log(metadata);
+		if (metadata.status !== "OK" || !metadata.location) {
+			continue;
+		}
+
+		const latitude = Number(metadata.location.lat);
+		const longitude = Number(metadata.location.lng);
+
+		if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+			continue;
+		}
+
+		return {
+			latitude,
+			longitude,
+			heading: Math.random() * 360,
+		};
+	}
+
+	throw new Error("Could not find a Street View location for the game.");
+}
+
+function storeGeoGame(game) {
+	geoGames.set(game.id, game);
+	game.timeout = setTimeout(() => {
+		geoGames.delete(game.id);
+	}, geoGameLifetimeMs);
+	game.timeout.unref?.();
+}
+
+function clearGeoGame(gameId) {
+	const game = geoGames.get(gameId);
+
+	if (game?.timeout) {
+		clearTimeout(game.timeout);
+	}
+
+	geoGames.delete(gameId);
+}
+
+function getGeoGame(gameId) {
+	const game = geoGames.get(gameId);
+
+	if (!game) {
+		return null;
+	}
+
+	if (Date.now() - game.createdAt > geoGameLifetimeMs) {
+		clearGeoGame(gameId);
+		return null;
+	}
+
+	return game;
+}
+
+async function handlePlayGeoCommand(interaction) {
+	if (!googleMapsApiKey) {
+		await interaction.reply({
+			content: "Missing GOOGLE_MAPS_API_KEY in the environment. Add it to generate Street View games.",
+			ephemeral: true,
+		});
+		return;
+	}
+
+	await interaction.deferReply();
+
+	const game = await createGeoGame();
+	const gameId = randomGeoId();
+	const latitude = Number(game.latitude);
+	const longitude = Number(game.longitude);
+
+	storeGeoGame({
+		id: gameId,
+		ownerId: interaction.user.id,
+		channelId: interaction.channelId,
+		messageId: null,
+		latitude,
+		longitude,
+		createdAt: Date.now(),
+	});
+
+	await interaction.editReply({
+		content: `${interaction.user} started a GeoGuess round. Click Submit Guess when you have an answer.`,
+		embeds: [
+			new EmbedBuilder()
+				.setTitle("GeoGuess")
+				.setDescription("Study the Street View image and submit your best guess.")
+				.setColor(0x1abc9c)
+				.setImage(buildGeoStreetViewUrl(latitude, longitude, game.heading))
+				.setFooter({ text: "Guess with a place name or coordinates" }),
+		],
+		components: [buildGeoGuessButton(gameId)],
+	});
+
+	const replyMessage = await interaction.fetchReply();
+	const storedGame = getGeoGame(gameId);
+
+	if (storedGame) {
+		storedGame.messageId = replyMessage.id;
+	}
+}
+
+async function handleGeoGuessButton(interaction) {
+	const gameId = interaction.customId.split(":").slice(2).join(":");
+	const game = getGeoGame(gameId);
+
+	if (!game) {
+		await interaction.reply({ content: "That GeoGuess game has expired. Start a new one with /playgeo.", ephemeral: true });
+		return;
+	}
+
+	if (interaction.user.id !== game.ownerId) {
+		await interaction.reply({ content: "Only the player who started this game can submit the guess.", ephemeral: true });
+		return;
+	}
+
+	await interaction.showModal(buildGeoGuessModal(gameId));
+}
+
+async function handleGeoGuessModal(interaction) {
+	const gameId = interaction.customId.split(":").slice(2).join(":");
+	const game = getGeoGame(gameId);
+
+	if (!game) {
+		await interaction.reply({ content: "That GeoGuess game has expired. Start a new one with /playgeo.", ephemeral: true });
+		return;
+	}
+
+	if (interaction.user.id !== game.ownerId) {
+		await interaction.reply({ content: "Only the player who started this game can submit the guess.", ephemeral: true });
+		return;
+	}
+
+	const guess = normalizeText(interaction.fields.getTextInputValue(`playgeo:guess-input:${gameId}`));
+
+	if (!guess) {
+		await interaction.reply({ content: "Please enter a location guess.", ephemeral: true });
+		return;
+	}
+
+	await interaction.deferReply({ ephemeral: true });
+
+	try {
+		const guessedCoordinates = await geocodeGuessToCoordinates(guess);
+
+		if (!guessedCoordinates) {
+			await interaction.editReply({ content: "I could not resolve that guess. Try a clearer place name or coordinates like 51.5, -0.12." });
+			return;
+		}
+
+		const distanceKm = haversineDistanceKm(
+			guessedCoordinates.latitude,
+			guessedCoordinates.longitude,
+			game.latitude,
+			game.longitude
+		);
+
+		await interaction.editReply({
+			content: `Your guess is ${formatGeoGuessDistance(distanceKm)} away from the Street View location.\nAnswer: ${game.latitude.toFixed(5)}, ${game.longitude.toFixed(5)}`,
+		});
+
+		if (game.channelId && game.messageId) {
+			const channel = await client.channels.fetch(game.channelId).catch(() => null);
+			const originalMessage = channel?.messages?.fetch ? await channel.messages.fetch(game.messageId).catch(() => null) : null;
+
+			if (originalMessage) {
+				await originalMessage.edit({
+					content: `${originalMessage.content}\n\nSolved by ${interaction.user}.`,
+					components: [],
+				}).catch(() => {});
+			}
+		}
+	} finally {
+		clearGeoGame(gameId);
+	}
 }
 
 function normalizeProgress(value, status) {
@@ -308,6 +639,10 @@ function buildCommands() {
 			)
 			.toJSON(),
 		new SlashCommandBuilder()
+			.setName("playgeo")
+			.setDescription("Start a GeoGuess game using Google Street View")
+			.toJSON(),
+		new SlashCommandBuilder()
 			.setName("leader")
 			.setDescription("Leader tools")
 			.addSubcommand((subcommand) =>
@@ -363,6 +698,54 @@ client.once("clientReady", async () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
+	if (interaction.isButton() && interaction.customId.startsWith("playgeo:guess:")) {
+		try {
+			await handleGeoGuessButton(interaction);
+		} catch (error) {
+			console.error("GeoGuess button failed:", error);
+			if (!interaction.replied && !interaction.deferred) {
+				await interaction.reply({ content: "Something went wrong while opening the guess form.", ephemeral: true }).catch(() => {});
+			}
+		}
+
+		return;
+	}
+
+	if (interaction.isModalSubmit() && interaction.customId.startsWith("playgeo:modal:")) {
+		try {
+			await handleGeoGuessModal(interaction);
+		} catch (error) {
+			console.error("GeoGuess modal failed:", error);
+			if (interaction.deferred || interaction.replied) {
+				await interaction.followUp({ content: "Something went wrong while checking your guess.", ephemeral: true }).catch(() => {});
+			} else {
+				await interaction.reply({ content: "Something went wrong while checking your guess.", ephemeral: true }).catch(() => {});
+			}
+		}
+
+		return;
+	}
+
+	if (interaction.isChatInputCommand() && interaction.commandName === "playgeo") {
+		try {
+			await handlePlayGeoCommand(interaction);
+		} catch (error) {
+			console.error("GeoGuess setup failed:", error);
+			const message = googleMapsApiKey
+				? "Something went wrong while starting GeoGuess."
+				: "Missing GOOGLE_MAPS_API_KEY in the environment.";
+
+			if (interaction.replied || interaction.deferred) {
+				await interaction.followUp({ content: message, ephemeral: true }).catch(() => {});
+				return;
+			}
+
+			await interaction.reply({ content: message, ephemeral: true }).catch(() => {});
+		}
+
+		return;
+	}
+
 	if (!interaction.isChatInputCommand() || (interaction.commandName !== "work" && interaction.commandName !== "leader")) {
 		return;
 	}

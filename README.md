@@ -8,6 +8,7 @@ A Discord bot for tracking and managing work items with progress tracking. Each 
 - Node.js v18 or higher
 - PostgreSQL database (e.g., Supabase)
 - Discord bot token and app ID
+- Google Maps API key for Street View and geocoding
 
 ### Installation
 
@@ -27,6 +28,7 @@ A Discord bot for tracking and managing work items with progress tracking. Each 
    - `DISCORD_CLIENT_ID`: Your Discord app ID
    - `DISCORD_GUILD_ID`: (Optional) Your Discord server ID for faster command registration
    - `DATABASE_URL`: PostgreSQL connection string
+   - `GOOGLE_MAPS_API_KEY`: API key with Street View Static API and Geocoding API enabled
 
 ### Running the Bot
 
@@ -133,6 +135,26 @@ Export all work items you lead as a CSV file.
 
 ---
 
+### `/playgeo`
+
+Start a GeoGuess round using a random Google Street View image.
+
+**Parameters:**
+- None
+
+**Usage:**
+```
+/playgeo
+```
+
+**Result:**
+- Posts a Street View image in the channel
+- Adds a Submit Guess button
+- Lets the player enter a place name, address, or coordinates in a modal
+- The bot calculates the distance between the guess and the hidden Street View location
+
+---
+
 ## Features
 
 ### Status Management
@@ -191,6 +213,7 @@ CREATE INDEX work_items_owner_idx ON public.work_items (workowner);
 | `DISCORD_CLIENT_ID` | ✓ | Application ID from Discord Developer Portal |
 | `DISCORD_GUILD_ID` | ✗ | Server ID for faster command registration (optional) |
 | `DATABASE_URL` | ✓ | PostgreSQL connection string |
+| `GOOGLE_MAPS_API_KEY` | ✓ | Google Maps API key with Street View Static API and Geocoding API enabled |
 
 ## Troubleshooting
 
@@ -201,6 +224,11 @@ CREATE INDEX work_items_owner_idx ON public.work_items (workowner);
 ### "Missing DATABASE_URL in the environment"
 - Check that `.env` file has `DATABASE_URL` set
 - Verify the PostgreSQL connection string is valid
+
+### "Missing GOOGLE_MAPS_API_KEY in the environment"
+- Check that `.env` file has `GOOGLE_MAPS_API_KEY` set
+- Verify the key has Street View Static API and Geocoding API enabled
+- Confirm billing and API restrictions allow requests from this app
 
 ### "relation "public.work_items" does not exist"
 - Database schema failed to create
