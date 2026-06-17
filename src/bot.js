@@ -16,6 +16,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
 const guildId = process.env.DISCORD_GUILD_ID;
+const waqiToken = process.env.API_WAQI_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
 const pool = databaseUrl
 	? new Pool({
@@ -274,6 +275,68 @@ function buildWorkEmbed(item) {
 		.setFooter({ text: `Work ID: ${item.id}` });
 }
 
+function formatWeatherValue(value, unit) {
+	if (value === undefined || value === null || value === "") {
+		return "N/A";
+	}
+
+	return unit ? `${value} ${unit}` : `${value}`;
+}
+
+function pickWeatherMetric(data, key) {
+	return data?.iaqi?.[key]?.v ?? data?.forecast?.daily?.[key]?.[0]?.avg ?? null;
+}
+
+function buildWeatherEmbed(data) {
+	const aqi = data?.aqi ?? null;
+	const pm25 = pickWeatherMetric(data, "pm25");
+	const temperature = pickWeatherMetric(data, "t");
+	const humidity = pickWeatherMetric(data, "h");
+	const pressure = pickWeatherMetric(data, "p");
+	const wind = pickWeatherMetric(data, "w");
+	const stationName = data?.city?.name || "WAQI station @5773";
+	const lastUpdated = data?.time?.s || "Unknown";
+	const color = aqi === null ? 0x95a5a6 : aqi <= 50 ? 0x2ecc71 : aqi <= 100 ? 0xf1c40f : aqi <= 150 ? 0xe67e22 : 0xe74c3c;
+
+	return new EmbedBuilder()
+		.setTitle("Weather and Air Quality")
+		.setColor(color)
+		.setDescription(`Station: ${stationName}`)
+		.addFields(
+			{ name: "AQI", value: formatWeatherValue(aqi, ""), inline: true },
+			{ name: "PM2.5", value: formatWeatherValue(pm25, "µg/m³"), inline: true },
+			{ name: "Temperature", value: formatWeatherValue(temperature, "°C"), inline: true },
+			{ name: "Humidity", value: formatWeatherValue(humidity, "%"), inline: true },
+			{ name: "Pressure", value: formatWeatherValue(pressure, "hPa"), inline: true },
+			{ name: "Wind", value: formatWeatherValue(wind, "m/s"), inline: true },
+			{ name: "Last Updated", value: lastUpdated, inline: false }
+		)
+		.setFooter({ text: "Source: api.waqi.info/feed/@5773" });
+}
+
+async function fetchWaqiStation() {
+	if (!waqiToken) {
+		throw new Error("Missing API_WAQI_TOKEN in the environment.");
+	}
+
+	const url = new URL("https://api.waqi.info/feed/@5773/");
+	url.searchParams.set("token", waqiToken);
+
+	const response = await fetch(url);
+
+	if (!response.ok) {
+		throw new Error(`WAQI request failed with status ${response.status}.`);
+	}
+
+	const payload = await response.json();
+
+	if (payload.status !== "ok" || !payload.data) {
+		throw new Error(payload.data || payload.message || "WAQI returned an unexpected response.");
+	}
+
+	return payload.data;
+}
+
 function buildCommands() {
 	return [
 		new SlashCommandBuilder()
@@ -306,6 +369,10 @@ function buildCommands() {
 							.setRequired(true)
 					)
 			)
+			.toJSON(),
+		new SlashCommandBuilder()
+			.setName("weather")
+			.setDescription("Check weather and PM2.5 from WAQI")
 			.toJSON(),
 		new SlashCommandBuilder()
 			.setName("leader")
@@ -363,11 +430,23 @@ client.once("clientReady", async () => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-	if (!interaction.isChatInputCommand() || (interaction.commandName !== "work" && interaction.commandName !== "leader")) {
+	if (
+		!interaction.isChatInputCommand() ||
+		(interaction.commandName !== "work" && interaction.commandName !== "leader" && interaction.commandName !== "weather")
+	) {
 		return;
 	}
 
 	try {
+		if (interaction.commandName === "weather") {
+			const data = await fetchWaqiStation();
+
+			await interaction.reply({
+				embeds: [buildWeatherEmbed(data)],
+			});
+			return;
+		}
+
 		if (interaction.options.getSubcommand() === "add") {
 			const leadername = readTextOption(interaction, "leadername");
 			const workname = readTextOption(interaction, "workname");
